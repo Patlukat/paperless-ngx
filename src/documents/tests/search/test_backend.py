@@ -9,6 +9,10 @@ from documents.search._backend import SearchMode
 from documents.search._backend import TantivyBackend
 from documents.search._backend import get_backend
 from documents.search._backend import reset_backend
+from documents.tests.factories import CorrespondentFactory
+from documents.tests.factories import DocumentFactory
+from documents.tests.factories import DocumentTypeFactory
+from documents.tests.factories import TagFactory
 
 pytestmark = [pytest.mark.search, pytest.mark.django_db]
 
@@ -211,6 +215,130 @@ class TestSearch:
         )
         assert (
             len(backend.search_ids("sswo gu", user=None, search_mode=SearchMode.TITLE))
+            == 1
+        )
+
+    @pytest.mark.parametrize(
+        ("mode", "title", "content", "hits", "misses"),
+        [
+            pytest.param(
+                SearchMode.QUERY,
+                "CJK document",
+                "東京都の人口は約1400万人です",
+                ["東京", "人口"],
+                ["大阪"],
+                id="query_mode_cjk_content",
+            ),
+            pytest.param(
+                SearchMode.TEXT,
+                "CJK document",
+                "東京都の人口は約1400万人です",
+                ["東京"],
+                ["大阪"],
+                id="text_mode_cjk_content",
+            ),
+            pytest.param(
+                SearchMode.TITLE,
+                "東京都の報告書",
+                "This document is about Tokyo.",
+                ["東京", "報告"],
+                ["大阪"],
+                id="title_mode_cjk_title",
+            ),
+        ],
+    )
+    def test_cjk_search_finds_matching_documents(
+        self,
+        backend: TantivyBackend,
+        mode: SearchMode,
+        title: str,
+        content: str,
+        hits: list[str],
+        misses: list[str],
+    ) -> None:
+        """CJK queries must match documents via bigram fields in all three search modes."""
+        doc = DocumentFactory(title=title, content=content)
+        backend.add_or_update(doc)
+
+        for query in hits:
+            assert len(backend.search_ids(query, user=None, search_mode=mode)) == 1, (
+                f"Expected {query!r} to match in {mode} mode"
+            )
+        for query in misses:
+            assert len(backend.search_ids(query, user=None, search_mode=mode)) == 0, (
+                f"Expected {query!r} not to match in {mode} mode"
+            )
+
+    def test_title_mode_cjk_does_not_match_content_only(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """Title-only CJK search must not return docs where CJK appears only in content."""
+        doc = DocumentFactory(
+            title="Tokyo report",
+            content="東京都の人口は約1400万人です",
+        )
+        backend.add_or_update(doc)
+
+        assert (
+            len(backend.search_ids("東京", user=None, search_mode=SearchMode.TITLE))
+            == 0
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "query", "miss"),
+        [
+            pytest.param("correspondent", "東京", "大阪", id="cjk_correspondent"),
+            pytest.param("document_type", "請求書", "領収書", id="cjk_document_type"),
+            pytest.param("tag", "重要", "普通", id="cjk_tag"),
+        ],
+    )
+    def test_cjk_metadata_search_via_query_mode(
+        self,
+        backend: TantivyBackend,
+        field: str,
+        query: str,
+        miss: str,
+    ) -> None:
+        """CJK in correspondent/document_type/tag names must be searchable via global search."""
+        if field == "correspondent":
+            doc = DocumentFactory(correspondent=CorrespondentFactory(name=query))
+        elif field == "document_type":
+            doc = DocumentFactory(document_type=DocumentTypeFactory(name=query))
+        else:
+            tag = TagFactory(name=query)
+            doc = DocumentFactory()
+            doc.tags.add(tag)
+        backend.add_or_update(doc)
+
+        assert (
+            len(backend.search_ids(query, user=None, search_mode=SearchMode.QUERY)) == 1
+        ), f"Expected CJK {field} name {query!r} to match"
+        assert (
+            len(backend.search_ids(miss, user=None, search_mode=SearchMode.QUERY)) == 0
+        ), f"Expected {miss!r} not to match"
+
+    def test_cjk_text_mode_does_not_leak_field_query_semantics(
+        self,
+        backend: TantivyBackend,
+    ) -> None:
+        """TEXT mode is plain-text over content: a 'field:CJK' input must not be
+        parsed as a structured query against that field. A doc tagged 重要 with
+        no 重要 in its content must NOT match the TEXT-mode query 'tag:重要'."""
+        tag = TagFactory(name="重要")
+        doc = DocumentFactory(title="report", content="just english content")
+        doc.tags.add(tag)
+        backend.add_or_update(doc)
+
+        assert (
+            len(backend.search_ids("tag:重要", user=None, search_mode=SearchMode.TEXT))
+            == 0
+        )
+        # Sanity: the CJK run still matches when it is actually in the content.
+        doc2 = DocumentFactory(title="report2", content="本文に重要な情報")
+        backend.add_or_update(doc2)
+        assert (
+            len(backend.search_ids("tag:重要", user=None, search_mode=SearchMode.TEXT))
             == 1
         )
 

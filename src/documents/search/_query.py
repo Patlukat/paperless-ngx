@@ -84,6 +84,38 @@ _SIMPLE_QUERY_TOKEN_RE = regex.compile(r"\S+")
 # In natural-language queries (e.g., "H52.1 - Kurzsichtigkeit"), the dash is a separator.
 _SPACED_OPERATOR_RE = regex.compile(r"\s+[-+]\s+")
 _TRAILING_OPERATOR_RE = regex.compile(r"\s+[-+]+\s*$")
+# Matches CJK/Hangul characters so queries can be routed to bigram fields.
+# Uses Unicode properties to cover all blocks including Extension B+ planes.
+_CJK_RE: Final = regex.compile(r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]+")
+
+
+def _has_cjk(text: str) -> bool:
+    """Return True if text contains any CJK characters."""
+    return bool(_CJK_RE.search(text))
+
+
+def _build_cjk_query(
+    index: tantivy.Index,
+    raw_query: str,
+    fields: list[str],
+) -> tantivy.Query | None:
+    """Build a bigram-field query from the CJK runs in ``raw_query``.
+
+    Only the CJK character runs are extracted and parsed; ASCII field prefixes,
+    boolean operators and date keywords are discarded. This keeps the CJK clause
+    plain-text and consistent across query/simple modes (no leaked ``field:``
+    semantics, no parse failures from spaced ``-``/``+``), and avoids feeding
+    Latin tokens into the character-bigram matcher (which would produce spurious
+    matches against unrelated Latin text). Returns None when there is no CJK
+    text or the parse fails.
+    """
+    cjk_text = " ".join(_CJK_RE.findall(raw_query))
+    if not cjk_text:
+        return None
+    try:
+        return index.parse_query(cjk_text, fields)
+    except Exception:
+        return None
 
 
 def _fmt(dt: datetime) -> str:
@@ -491,6 +523,15 @@ DEFAULT_SEARCH_FIELDS = [
 ]
 SIMPLE_SEARCH_FIELDS = ["simple_title", "simple_content"]
 TITLE_SEARCH_FIELDS = ["simple_title"]
+_CJK_ALL_FIELDS: Final[list[str]] = [
+    "bigram_content",
+    "bigram_title",
+    "bigram_correspondent",
+    "bigram_document_type",
+    "bigram_tag",
+]
+_CJK_CONTENT_FIELDS: Final[list[str]] = ["bigram_content"]
+_CJK_TITLE_FIELDS: Final[list[str]] = ["bigram_title"]
 _FIELD_BOOSTS = {"title": 2.0}
 _SIMPLE_FIELD_BOOSTS = {"simple_title": 2.0}
 
@@ -568,6 +609,19 @@ def parse_user_query(
         field_boosts=_FIELD_BOOSTS,
     )
 
+    # CJK characters are stripped by ascii_fold in the standard tokenizer, so
+    # they would never match content/title. Route CJK queries to the bigram
+    # fields, which use an ngram tokenizer that preserves non-ASCII text.
+    cjk_query = (
+        _build_cjk_query(index, raw_query, _CJK_ALL_FIELDS)
+        if _has_cjk(raw_query)
+        else None
+    )
+
+    clauses: list[tuple[tantivy.Occur, tantivy.Query]] = [
+        (tantivy.Occur.Should, exact),
+    ]
+
     threshold = settings.ADVANCED_FUZZY_SEARCH_THRESHOLD
     if threshold is not None:
         fuzzy = index.parse_query(
@@ -577,38 +631,50 @@ def parse_user_query(
             # (prefix=True, distance=1, transposition_cost_one=True) — edit-distance fuzziness
             fuzzy_fields={f: (True, 1, True) for f in DEFAULT_SEARCH_FIELDS},
         )
-        return tantivy.Query.boolean_query(
-            [
-                (tantivy.Occur.Should, exact),
-                # 0.1 boost keeps fuzzy hits ranked below exact matches (intentional)
-                (tantivy.Occur.Should, tantivy.Query.boost_query(fuzzy, 0.1)),
-            ],
-        )
+        # 0.1 boost keeps fuzzy hits ranked below exact matches (intentional)
+        clauses.append((tantivy.Occur.Should, tantivy.Query.boost_query(fuzzy, 0.1)))
 
-    return exact
+    if cjk_query is not None:
+        clauses.append((tantivy.Occur.Should, cjk_query))
+
+    if len(clauses) == 1:
+        return exact
+    return tantivy.Query.boolean_query(clauses)
 
 
 def parse_simple_query(
     index: tantivy.Index,
     raw_query: str,
     fields: list[str],
+    cjk_fields: list[str] | None = None,
 ) -> tantivy.Query:
     """
     Parse a plain-text query using Tantivy over a restricted field set.
 
     Query string is escaped and normalized to be treated as "simple" text query.
+    When cjk_fields is provided and the query contains CJK characters, an
+    additional Should clause searches those bigram-tokenized fields so that
+    CJK text is not silently dropped by ascii_fold.
     """
     tokens = _simple_query_tokens(raw_query)
-    if not tokens:
-        return tantivy.Query.empty_query()
 
-    field_queries = [
-        (tantivy.Occur.Should, _build_simple_field_query(index, field, tokens))
-        for field in fields
-    ]
-    if len(field_queries) == 1:
-        return field_queries[0][1]
-    return tantivy.Query.boolean_query(field_queries)
+    clauses: list[tuple[tantivy.Occur, tantivy.Query]] = []
+    if tokens:
+        clauses = [
+            (tantivy.Occur.Should, _build_simple_field_query(index, field, tokens))
+            for field in fields
+        ]
+
+    if cjk_fields and _has_cjk(raw_query):
+        cjk_q = _build_cjk_query(index, raw_query, cjk_fields)
+        if cjk_q is not None:
+            clauses.append((tantivy.Occur.Should, cjk_q))
+
+    if not clauses:
+        return tantivy.Query.empty_query()
+    if len(clauses) == 1:
+        return clauses[0][1]
+    return tantivy.Query.boolean_query(clauses)
 
 
 def parse_simple_text_highlight_query(
@@ -640,7 +706,12 @@ def parse_simple_text_query(
     Parse a plain-text query over title/content for simple search inputs.
     """
 
-    return parse_simple_query(index, raw_query, SIMPLE_SEARCH_FIELDS)
+    return parse_simple_query(
+        index,
+        raw_query,
+        SIMPLE_SEARCH_FIELDS,
+        cjk_fields=_CJK_CONTENT_FIELDS,
+    )
 
 
 def parse_simple_title_query(
@@ -651,4 +722,9 @@ def parse_simple_title_query(
     Parse a plain-text query over the title field only.
     """
 
-    return parse_simple_query(index, raw_query, TITLE_SEARCH_FIELDS)
+    return parse_simple_query(
+        index,
+        raw_query,
+        TITLE_SEARCH_FIELDS,
+        cjk_fields=_CJK_TITLE_FIELDS,
+    )
