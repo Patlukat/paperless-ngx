@@ -11,6 +11,7 @@ from llama_index.core.base.embeddings.base import BaseEmbedding
 from documents.models import Document
 from documents.models import PaperlessTask
 from documents.tests.factories import PaperlessTaskFactory
+from paperless.models import ApplicationConfiguration
 from paperless_ai import indexing
 
 
@@ -81,20 +82,32 @@ def test_build_document_node_excludes_metadata_from_embedding(real_document) -> 
 
 @pytest.mark.django_db
 def test_build_document_node_uses_rag_chunk_settings(real_document) -> None:
+    app_config, _ = ApplicationConfiguration.objects.get_or_create()
+    app_config.llm_embedding_chunk_size = 512
+    app_config.save()
+
     with patch("llama_index.core.node_parser.SimpleNodeParser") as mock_parser:
         mock_parser.return_value.get_nodes_from_documents.return_value = []
 
         indexing.build_document_node(real_document)
 
-        mock_parser.assert_called_once_with(chunk_size=1024, chunk_overlap=200)
+        mock_parser.assert_called_once_with(chunk_size=512, chunk_overlap=200)
 
 
 def test_get_rag_chunk_overlap_clamps_to_chunk_size() -> None:
-    with (
-        patch("paperless_ai.indexing.RAG_CHUNK_SIZE", 64),
-        patch("paperless_ai.indexing.RAG_CHUNK_OVERLAP", 128),
-    ):
-        assert indexing.get_rag_chunk_overlap() == 63
+    with patch("paperless_ai.indexing.RAG_CHUNK_OVERLAP", 128):
+        assert indexing.get_rag_chunk_overlap(64) == 63
+
+
+@pytest.mark.django_db
+def test_get_rag_prompt_helper_uses_context_setting() -> None:
+    app_config, _ = ApplicationConfiguration.objects.get_or_create()
+    app_config.llm_context_size = 4096
+    app_config.save()
+
+    prompt_helper = indexing.get_rag_prompt_helper()
+
+    assert prompt_helper.context_window == 4096
 
 
 @pytest.mark.django_db
@@ -103,13 +116,22 @@ def test_update_llm_index(
     real_document,
     mock_embed_model,
 ) -> None:
-    with patch("documents.models.Document.objects.all") as mock_all:
+    mock_config = MagicMock()
+    mock_config.llm_embedding_chunk_size = 512
+    with (
+        patch("documents.models.Document.objects.all") as mock_all,
+        patch("paperless_ai.indexing.AIConfig", return_value=mock_config) as ai_config,
+        patch("paperless_ai.indexing.build_document_node") as build_document_node,
+    ):
         mock_queryset = MagicMock()
         mock_queryset.exists.return_value = True
         mock_queryset.__iter__.return_value = iter([real_document])
         mock_all.return_value = mock_queryset
+        build_document_node.return_value = []
         indexing.update_llm_index(rebuild=True)
 
+        ai_config.assert_called_once()
+        build_document_node.assert_called_once_with(real_document, chunk_size=512)
         assert any(temp_llm_index_dir.glob("*.json"))
 
 

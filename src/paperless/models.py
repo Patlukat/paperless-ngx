@@ -318,6 +318,18 @@ class ApplicationConfiguration(AbstractSingletonModel):
         max_length=256,
     )
 
+    llm_embedding_chunk_size = models.PositiveSmallIntegerField(
+        verbose_name=_("Sets the LLM embedding chunk size"),
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
+
+    llm_context_size = models.PositiveIntegerField(
+        verbose_name=_("Sets the LLM context size"),
+        null=True,
+        validators=[MinValueValidator(1)],
+    )
+
     llm_backend = models.CharField(
         verbose_name=_("Sets the LLM backend"),
         blank=True,

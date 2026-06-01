@@ -12,6 +12,7 @@ from documents.models import Document
 from documents.models import PaperlessTask
 from documents.utils import IterWrapper
 from documents.utils import identity
+from paperless.config import AIConfig
 from paperless_ai.embedding import build_llm_index_text
 from paperless_ai.embedding import get_embedding_dim
 from paperless_ai.embedding import get_embedding_model
@@ -23,9 +24,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("paperless_ai.indexing")
 
-RAG_CONTEXT_WINDOW = 8192
 RAG_NUM_OUTPUT = 512
-RAG_CHUNK_SIZE = 1024
 RAG_CHUNK_OVERLAP = 200
 
 
@@ -95,7 +94,11 @@ def get_or_create_storage_context(*, rebuild=False):
     )
 
 
-def build_document_node(document: Document) -> list["BaseNode"]:
+def build_document_node(
+    document: Document,
+    *,
+    chunk_size: int | None = None,
+) -> list["BaseNode"]:
     """
     Given a Document, returns parsed Nodes ready for indexing.
     """
@@ -126,9 +129,10 @@ def build_document_node(document: Document) -> list["BaseNode"]:
         metadata=metadata,
         excluded_embed_metadata_keys=list(metadata.keys()),
     )
+    chunk_size = chunk_size or get_rag_chunk_size()
     parser = SimpleNodeParser(
-        chunk_size=RAG_CHUNK_SIZE,
-        chunk_overlap=get_rag_chunk_overlap(),
+        chunk_size=chunk_size,
+        chunk_overlap=get_rag_chunk_overlap(chunk_size),
     )
     return parser.get_nodes_from_documents([doc])
 
@@ -186,18 +190,36 @@ def vector_store_file_exists():
     return Path(settings.LLM_INDEX_DIR / "default__vector_store.json").exists()
 
 
-def get_rag_chunk_overlap() -> int:
-    return min(RAG_CHUNK_OVERLAP, RAG_CHUNK_SIZE - 1)
+def get_rag_chunk_size() -> int:
+    return AIConfig().llm_embedding_chunk_size
 
 
-def get_rag_prompt_helper():
+def get_rag_context_size() -> int:
+    return AIConfig().llm_context_size
+
+
+def get_rag_chunk_overlap(chunk_size: int | None = None) -> int:
+    chunk_size = chunk_size or get_rag_chunk_size()
+    return min(RAG_CHUNK_OVERLAP, chunk_size - 1)
+
+
+def get_rag_prompt_helper(
+    *,
+    chunk_size: int | None = None,
+    context_size: int | None = None,
+):
     from llama_index.core.indices.prompt_helper import PromptHelper
 
+    if chunk_size is None or context_size is None:
+        config = AIConfig()
+        chunk_size = chunk_size or config.llm_embedding_chunk_size
+        context_size = context_size or config.llm_context_size
+
     return PromptHelper(
-        context_window=RAG_CONTEXT_WINDOW,
+        context_window=context_size,
         num_output=RAG_NUM_OUTPUT,
         chunk_overlap_ratio=0.1,
-        chunk_size_limit=RAG_CHUNK_SIZE,
+        chunk_size_limit=chunk_size,
     )
 
 
@@ -219,6 +241,9 @@ def update_llm_index(
         logger.warning(msg)
         return msg
 
+    config = AIConfig()
+    chunk_size = config.llm_embedding_chunk_size
+
     if rebuild or not vector_store_file_exists():
         # remove meta.json to force re-detection of embedding dim
         (settings.LLM_INDEX_DIR / "meta.json").unlink(missing_ok=True)
@@ -230,7 +255,7 @@ def update_llm_index(
         llama_settings.Settings.embed_model = embed_model
         storage_context = get_or_create_storage_context(rebuild=True)
         for document in iter_wrapper(documents):
-            document_nodes = build_document_node(document)
+            document_nodes = build_document_node(document, chunk_size=chunk_size)
             nodes.extend(document_nodes)
 
         index = VectorStoreIndex(
@@ -262,10 +287,10 @@ def update_llm_index(
 
                 # Again, delete from docstore, FAISS IndexFlatL2 are append-only
                 index.docstore.delete_document(node.node_id)
-                nodes.extend(build_document_node(document))
+                nodes.extend(build_document_node(document, chunk_size=chunk_size))
             else:
                 # New document, add it
-                nodes.extend(build_document_node(document))
+                nodes.extend(build_document_node(document, chunk_size=chunk_size))
 
         if nodes:
             msg = "LLM index updated successfully."
@@ -287,7 +312,7 @@ def llm_index_add_or_update_document(document: Document):
     Adds or updates a document in the LLM index.
     If the document already exists, it will be replaced.
     """
-    new_nodes = build_document_node(document)
+    new_nodes = build_document_node(document, chunk_size=get_rag_chunk_size())
 
     index = load_or_build_index(nodes=new_nodes)
 
@@ -309,15 +334,27 @@ def llm_index_remove_document(document: Document):
     index.storage_context.persist(persist_dir=settings.LLM_INDEX_DIR)
 
 
-def truncate_content(content: str) -> str:
+def truncate_content(
+    content: str,
+    *,
+    chunk_size: int | None = None,
+    context_size: int | None = None,
+) -> str:
     from llama_index.core.prompts import PromptTemplate
     from llama_index.core.text_splitter import TokenTextSplitter
 
-    prompt_helper = get_rag_prompt_helper()
+    if chunk_size is None or context_size is None:
+        config = AIConfig()
+        chunk_size = chunk_size or config.llm_embedding_chunk_size
+        context_size = context_size or config.llm_context_size
+    prompt_helper = get_rag_prompt_helper(
+        chunk_size=chunk_size,
+        context_size=context_size,
+    )
     splitter = TokenTextSplitter(
         separator=" ",
-        chunk_size=RAG_CHUNK_SIZE,
-        chunk_overlap=get_rag_chunk_overlap(),
+        chunk_size=chunk_size,
+        chunk_overlap=get_rag_chunk_overlap(chunk_size),
     )
     content_chunks = splitter.split_text(content)
     truncated_chunks = prompt_helper.truncate(
@@ -376,8 +413,11 @@ def query_similar_documents(
         doc_ids=doc_node_ids,
     )
 
+    config = AIConfig()
     query_text = truncate_content(
         (document.title or "") + "\n" + (document.content or ""),
+        chunk_size=config.llm_embedding_chunk_size,
+        context_size=config.llm_context_size,
     )
     results = retriever.retrieve(query_text)
 
