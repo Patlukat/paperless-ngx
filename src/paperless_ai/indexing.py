@@ -31,8 +31,13 @@ RAG_CHUNK_OVERLAP = 200
 
 
 def _index_lock_path() -> Path:
-    """Return the path used as the file lock for FAISS index mutations."""
-    return settings.LLM_INDEX_DIR / "index.lock"
+    """Return the path used as the file lock for FAISS index mutations.
+
+    The lock file lives in DATA_DIR/locks/ (not inside LLM_INDEX_DIR) so that a
+    rebuild — which calls shutil.rmtree(LLM_INDEX_DIR) — cannot delete the lock
+    while another worker still holds it.
+    """
+    return settings.LLM_INDEX_LOCK
 
 
 def queue_llm_index_update_if_needed(*, rebuild: bool, reason: str) -> bool:
@@ -193,6 +198,15 @@ def remove_document_docstore_nodes(document: Document, index: "VectorStoreIndex"
     for node_id in existing_nodes:
         # Delete from docstore, FAISS IndexFlatL2 are append-only
         index.docstore.delete_document(node_id)
+        # Also purge the FAISS position -> UUID mapping so subsequent similarity
+        # queries don't raise KeyError on ghost vector positions.
+        stale_keys = [
+            k for k, v in index.index_struct.nodes_dict.items() if v == node_id
+        ]
+        for key in stale_keys:
+            del index.index_struct.nodes_dict[key]
+    # Re-sync the mutated index_struct so persist() writes the updated nodes_dict.
+    index.storage_context.index_store.add_index_struct(index.index_struct)
 
 
 def vector_store_file_exists():
@@ -300,7 +314,7 @@ def update_llm_index(
 
                     # Delete from docstore, FAISS IndexFlatL2 are append-only
                     for node in doc_nodes:
-                        index.docstore.delete_document(node.node_id)
+                        remove_document_docstore_nodes(document, index)
 
                 nodes.extend(build_document_node(document, chunk_size=chunk_size))
 
@@ -410,36 +424,48 @@ def query_similar_documents(
         )
         return []
 
-    index = load_or_build_index()
+    with FileLock(_index_lock_path()):
+        index = load_or_build_index()
 
-    # constrain only the node(s) that match the document IDs, if given
-    doc_node_ids = (
-        [
-            node.node_id
-            for node in index.docstore.docs.values()
-            if node.metadata.get("document_id") in allowed_document_ids
-        ]
-        if allowed_document_ids is not None
-        else None
-    )
-    if doc_node_ids is not None and not doc_node_ids:
-        return []
+        # constrain only the node(s) that match the document IDs, if given
+        doc_node_ids = (
+            [
+                node.node_id
+                for node in index.docstore.docs.values()
+                if node.metadata.get("document_id") in allowed_document_ids
+            ]
+            if allowed_document_ids is not None
+            else None
+        )
+        if doc_node_ids is not None and not doc_node_ids:
+            return []
 
-    from llama_index.core.retrievers import VectorIndexRetriever
+        from llama_index.core.retrievers import VectorIndexRetriever
 
-    retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=top_k,
-        doc_ids=doc_node_ids,
-    )
+        retriever = VectorIndexRetriever(
+            index=index,
+            similarity_top_k=top_k,
+            doc_ids=doc_node_ids,
+        )
 
-    config = AIConfig()
-    query_text = truncate_content(
-        (document.title or "") + "\n" + (document.content or ""),
-        chunk_size=config.llm_embedding_chunk_size,
-        context_size=config.llm_context_size,
-    )
-    results = retriever.retrieve(query_text)
+        config = AIConfig()
+        query_text = truncate_content(
+            (document.title or "") + "\n" + (document.content or ""),
+            chunk_size=config.llm_embedding_chunk_size,
+            context_size=config.llm_context_size,
+        )
+        try:
+            results = retriever.retrieve(query_text)
+        except KeyError as e:
+            # Ghost FAISS positions remain after deletion because IndexFlatL2 is
+            # append-only. Treat them as absent and return no results.
+            logger.debug(
+                "Skipping LLM similarity query for document %s due to a stale "
+                "FAISS position with no docstore node: %s",
+                document.pk,
+                e,
+            )
+            return []
 
     retrieved_document_ids: list[int] = []
     for node in results:

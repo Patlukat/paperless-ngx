@@ -13,6 +13,7 @@ from llama_index.core.base.embeddings.base import BaseEmbedding
 
 from documents.models import Document
 from documents.models import PaperlessTask
+from documents.signals import document_consumption_finished
 from documents.signals import document_updated
 from documents.tests.factories import DocumentFactory
 from documents.tests.factories import PaperlessTaskFactory
@@ -327,6 +328,26 @@ def test_remove_document_deletes_node_from_docstore(
     indexing.llm_index_remove_document(real_document)
     index = indexing.load_or_build_index()
     assert len(index.docstore.docs) == 0
+
+
+@pytest.mark.django_db
+def test_query_after_remove_does_not_raise_key_error(
+    temp_llm_index_dir,
+    real_document,
+    mock_embed_model,
+) -> None:
+    indexing.update_llm_index(rebuild=True)
+
+    query_doc = Document.objects.create(
+        title="Query",
+        content="query content",
+        added=timezone.now(),
+    )
+
+    indexing.llm_index_remove_document(real_document)
+
+    result = indexing.query_similar_documents(query_doc, top_k=5)
+    assert isinstance(result, list)
 
 
 @pytest.mark.django_db
@@ -659,6 +680,27 @@ class TestDocumentUpdatedSignalTriggersLlmReindex:
 
         mock_task.apply_async.assert_called_once_with(kwargs={"document": doc})
 
+    @pytest.mark.django_db
+    @override_settings(AI_ENABLED=True, LLM_EMBEDDING_BACKEND="huggingface")
+    def test_version_addition_consumption_enqueues_llm_index_once(
+        self,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """When a new version is consumed, the root document must be enqueued exactly once."""
+        mock_task = mocker.patch("documents.tasks.update_document_in_llm_index")
+
+        root_doc = DocumentFactory()
+        document_consumption_finished.send(
+            sender=object,
+            document=root_doc,
+            logging_group=None,
+            classifier=None,
+            original_file=None,
+        )
+        document_updated.send(sender=object, document=root_doc, skip_ai_index=True)
+
+        assert mock_task.apply_async.call_count == 1
+
 
 @pytest.mark.django_db
 class TestLlmIndexAddOrUpdateDocumentEmptyContent:
@@ -803,3 +845,54 @@ class TestLlmIndexLocking:
 
         mock_file_lock_cls.assert_called_once()
         mock_lock_instance.__enter__.assert_called_once()
+
+    def test_query_similar_documents_acquires_lock(
+        self,
+        temp_llm_index_dir: Path,
+        mocker: pytest_mock.MockerFixture,
+    ) -> None:
+        """query_similar_documents must enter the file lock before loading the index."""
+        call_order: list[str] = []
+
+        mock_lock_instance = MagicMock()
+        mock_lock_instance.__enter__ = MagicMock(
+            side_effect=lambda *_: call_order.append("lock_acquired"),
+        )
+        mock_lock_instance.__exit__ = MagicMock(return_value=False)
+
+        mock_file_lock_cls = mocker.patch(
+            "paperless_ai.indexing.FileLock",
+            return_value=mock_lock_instance,
+        )
+
+        mocker.patch(
+            "paperless_ai.indexing.vector_store_file_exists",
+            return_value=True,
+        )
+
+        mock_index = MagicMock()
+        mock_index.docstore.docs = {}
+
+        mocker.patch(
+            "paperless_ai.indexing.load_or_build_index",
+            side_effect=lambda *_a, **_kw: (
+                call_order.append("index_loaded") or mock_index
+            ),
+        )
+
+        mock_retriever = MagicMock()
+        mock_retriever.retrieve.return_value = []
+        mocker.patch(
+            "llama_index.core.retrievers.VectorIndexRetriever",
+            return_value=mock_retriever,
+        )
+
+        mocker.patch("paperless_ai.indexing.truncate_content", return_value="")
+
+        indexing.query_similar_documents(MagicMock(spec=Document))
+
+        mock_file_lock_cls.assert_called()
+        mock_lock_instance.__enter__.assert_called()
+        assert call_order.index("lock_acquired") < call_order.index("index_loaded"), (
+            "Lock must be acquired before the index is loaded"
+        )
